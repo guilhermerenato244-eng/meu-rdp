@@ -1,0 +1,4 @@
+# Um programa por linha (nome do pacote Chocolatey). Linhas com # são ignoradas.
+# googlechrome
+# 7zip
+# vscode
