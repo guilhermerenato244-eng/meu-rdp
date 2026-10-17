@@ -1,0 +1,247 @@
+name: Meu PC Steam
+
+on:
+  workflow_dispatch:
+    inputs:
+      osChoice:
+        description: 'Versão do Windows'
+        required: true
+        type: choice
+        default: 'windows-2022'
+        options:
+          - windows-latest
+          - windows-2025
+          - windows-2022
+      username:
+        description: 'Usuário do RDP'
+        required: false
+        default: 'meurdp'
+      hours:
+        description: 'Horas ligada (máx. 5.5)'
+        required: false
+        default: '5'
+
+jobs:
+  rdp:
+    runs-on: ${{ github.event.inputs.osChoice }}
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rede privada: o celular acessa pelo IP do Tailscale (100.x.x.x)
+      - name: Conectar ao Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: steam-github
+
+      # ---------- Recuperar dados da sessão anterior ----------
+      - name: Buscar backup anterior
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\backup\dados.7z
+          key: rdp-dados-restore-${{ github.run_id }}
+          restore-keys: |
+            rdp-dados-
+
+      - name: Preparar pasta Dados
+        shell: pwsh
+        env:
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+        run: |
+          New-Item -ItemType Directory -Force C:\Dados | Out-Null
+          if (Test-Path C:\backup\dados.7z) {
+            7z x -y "-p$env:ARCHIVE_PASS" -oC:\Dados C:\backup\dados.7z | Out-Null
+            Write-Host "Dados restaurados."
+          } else {
+            Write-Host "Nenhum backup anterior (primeira vez)."
+          }
+          # Atalho na área de trabalho de todos os usuários
+          $w = New-Object -ComObject WScript.Shell
+          $s = $w.CreateShortcut("C:\Users\Public\Desktop\Dados.lnk")
+          $s.TargetPath = "C:\Dados"
+          $s.Save()
+
+      # ---------- Otimização do Windows (antes do primeiro login) ----------
+      - name: Otimizar Windows
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Energia: alto desempenho, sem apagar tela nem suspender
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+
+          # Defender: sem proteção em tempo real (máquina descartável)
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true -DisableBehaviorMonitoring $true } catch { Write-Host "Defender não permitiu: $_" }
+
+          # Serviços dispensáveis (indexação, telemetria, atualizações, impressão...)
+          $servicos = 'WSearch','SysMain','DiagTrack','dmwappushservice','wuauserv','UsoSvc','DoSvc','WerSvc','MapsBroker','Spooler'
+          foreach ($s in $servicos) {
+            try {
+              Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $s -StartupType Disabled -ErrorAction SilentlyContinue
+            } catch {}
+          }
+
+          # Não abrir o Gerenciador do Servidor no login
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
+          Get-ScheduledTask -TaskName ServerManager -ErrorAction SilentlyContinue | Disable-ScheduledTask | Out-Null
+
+          # Visual leve: aplicado no perfil padrão, que o usuário RDP herda no 1º login
+          reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
+          function Set-Reg($path, $name, $val, $type) {
+            New-Item -Path $path -Force | Out-Null
+            New-ItemProperty -Path $path -Name $name -Value $val -PropertyType $type -Force | Out-Null
+          }
+          $r = 'Registry::HKEY_USERS\DefUser'
+          Set-Reg "$r\Control Panel\Desktop" 'Wallpaper' '' 'String'
+          Set-Reg "$r\Control Panel\Desktop" 'DragFullWindows' '0' 'String'
+          Set-Reg "$r\Control Panel\Colors" 'Background' '0 0 0' 'String'
+          Set-Reg "$r\Control Panel\Desktop\WindowMetrics" 'MinAnimate' '0' 'String'
+          Set-Reg "$r\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 2 'DWord'
+          Set-Reg "$r\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" 'TaskbarAnimations' 0 'DWord'
+          Set-Reg "$r\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'EnableTransparency' 0 'DWord'
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefUser | Out-Null
+
+          # Atalho para subir a prioridade de um processo (ex.: o jogo)
+          $linhas = @(
+            '@echo off',
+            'set /p n=Nome do processo sem .exe (ex: steam): ',
+            'powershell -NoProfile -Command "Get-Process -Name ''%n%'' | ForEach-Object { $_.PriorityClass = ''High'' }"',
+            'echo Pronto.',
+            'pause'
+          )
+          Set-Content -Path "C:\Users\Public\Desktop\Prioridade-alta.bat" -Value ($linhas -join "`r`n") -Encoding ASCII
+
+      # ---------- RDP ----------
+      - name: Ativar RDP e criar usuário
+        shell: pwsh
+        env:
+          RDP_USER: ${{ github.event.inputs.username }}
+        run: |
+          $chars = (48..57) + (65..90) + (97..122)
+          $pass = (-join ($chars | Get-Random -Count 20 | ForEach-Object { [char]$_ })) + "aA1!"
+          Write-Host "::add-mask::$pass"
+          "RDP_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $sec -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+      - name: Enviar login e senha no Telegram
+        shell: pwsh
+        env:
+          RDP_USER: ${{ github.event.inputs.username }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { $ts = "tailscale" }
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+
+          $text = "RDP pronto`nIP: $ip`nUsuário: $env:RDP_USER`nSenha: $env:RDP_PASS`n`nLigue o Tailscale no celular antes de conectar.`nSteam já instalada (abra e faça login). Salve arquivos na pasta Dados: só ela é guardada."
+          $body = @{ chat_id = $env:TG_CHAT_ID; text = $text }
+          Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendMessage" -Method Post -Body $body | Out-Null
+
+      # ---------- Steam, áudio e OpenGL por software ----------
+      - name: Ativar áudio
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-Service -Name AudioEndpointBuilder -StartupType Automatic
+          Set-Service -Name Audiosrv -StartupType Automatic
+          Start-Service AudioEndpointBuilder
+          Start-Service Audiosrv
+
+      - name: Instalar Steam
+        continue-on-error: true
+        shell: pwsh
+        run: choco install steam-client -y --no-progress
+
+      - name: Instalar Mesa3D (OpenGL por software)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ver = "24.3.4"
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$ver/mesa3d-$ver-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+          New-Item -ItemType Directory -Force -Path C:\mesa3d | Out-Null
+          7z x "$env:TEMP\mesa3d.7z" -oC:\mesa3d -y | Out-Null
+          $x64 = (Get-ChildItem C:\mesa3d -Directory -Recurse -Filter "x64" | Select-Object -First 1).FullName
+          $linhas = @(
+            '@echo off',
+            'if "%~1"=="" (echo Arraste a pasta do jogo sobre este arquivo & pause & exit /b)',
+            ('copy /Y "' + $x64 + '\opengl32.dll" "%~1\" >nul'),
+            ('copy /Y "' + $x64 + '\libgallium_wgl.dll" "%~1\" >nul'),
+            ('copy /Y "' + $x64 + '\libglapi.dll" "%~1\" >nul'),
+            'echo Mesa3D ativado em: %~1',
+            'pause'
+          )
+          Set-Content -Path "C:\Users\Public\Desktop\Ativar-OpenGL-no-jogo.bat" -Value ($linhas -join "`r`n") -Encoding ASCII
+
+      # ---------- Programas (lista no arquivo programas.txt) ----------
+      - name: Instalar programas
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (Test-Path programas.txt) {
+            Get-Content programas.txt | ForEach-Object {
+              $p = $_.Trim()
+              if ($p -and -not $p.StartsWith('#')) { choco install $p -y --no-progress }
+            }
+          }
+
+      - name: Manter ligada
+        shell: pwsh
+        env:
+          HOURS: ${{ github.event.inputs.hours }}
+        run: |
+          $h = [math]::Min([double]$env:HOURS, 5.5)
+          $end = (Get-Date).AddHours($h)
+          while ((Get-Date) -lt $end) { Start-Sleep -Seconds 60 }
+
+      # ---------- Guardar dados (roda mesmo se você cancelar) ----------
+      - name: Empacotar dados (criptografado)
+        if: always()
+        shell: pwsh
+        env:
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+        run: |
+          $n = (Get-ChildItem C:\Dados -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+          if ($n -gt 0) {
+            New-Item -ItemType Directory -Force C:\backup | Out-Null
+            Remove-Item C:\backup\dados.7z -ErrorAction SilentlyContinue
+            7z a -t7z "-p$env:ARCHIVE_PASS" -mhe=on -ssw C:\backup\dados.7z C:\Dados\*
+          } else {
+            Write-Host "Pasta Dados vazia, nada a guardar."
+          }
+
+      - name: Guardar backup
+        if: always() && hashFiles('C:/backup/dados.7z') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: C:\backup\dados.7z
+          key: rdp-dados-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Avisar no Telegram
+        if: always()
+        shell: pwsh
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          $body = @{ chat_id = $env:TG_CHAT_ID; text = "Sessão encerrada. Dados da pasta Dados guardados." }
+          Invoke-RestMethod -Uri "https://api.telegram.org/bot$($env:TG_BOT_TOKEN)/sendMessage" -Method Post -Body $body | Out-Null
+          
